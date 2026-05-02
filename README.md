@@ -20,7 +20,7 @@ It works offline. The only hard dependency is Python 3.10+ and the
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-org>/cra-sbom-cli.git
+git clone https://github.com/cra-compliance-lab/cra-sbom-cli
 cd cra-sbom-cli
 ./install.sh
 cra-sbom-report path/to/sbom.json
