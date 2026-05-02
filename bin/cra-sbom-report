@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# cra-sbom-report — generate a CRA-aligned SBOM compliance report from a
+# local SBOM file. Standalone distribution; bundles the compliance engine,
+# enrichment wrappers, and PDF exporter from the CRA SBOM Platform.
+#
+# Usage:
+#   cra-sbom-report <sbom-file> [--enhanced] [--no-enrich]
+#                   [--output <path.pdf>] [--json <path.json>]
+#
+# Exit codes:
+#   0  OK (verdict can still be FAIL — that is a compliance result, not an error)
+#   1  usage error
+#   2  SBOM file missing
+#   3  SBOM parse failed
+#   4  missing dependency (python3, reportlab)
+#   5  Python helper crashed
+
+set -euo pipefail
+
+# ---------- locate ourselves, even when invoked through a symlink ----------
+# Cross-platform realpath: prefer GNU `realpath`, fall back to python3 (which
+# we know is available because we depend on it anyway).
+_canonical_path() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$1"
+  else
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+  fi
+}
+
+SCRIPT_PATH="$(_canonical_path "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${SCRIPT_PATH}")" &>/dev/null && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
+PACKAGE_DIR="${REPO_ROOT}/cra_sbom_cli"
+
+if [[ ! -d "${PACKAGE_DIR}" ]] || [[ ! -f "${PACKAGE_DIR}/cli.py" ]]; then
+  echo "error: cannot find the cra_sbom_cli package at ${PACKAGE_DIR}" >&2
+  echo "       expected layout: <repo-root>/{bin/cra-sbom-report,cra_sbom_cli/cli.py}" >&2
+  exit 4
+fi
+
+# ---------- ANSI colors (only when stdout is a TTY) ----------
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_GREEN=$'\033[32m'
+  C_RED=$'\033[31m'
+  C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'
+  C_BLUE=$'\033[34m'
+else
+  C_RESET=''; C_BOLD=''; C_DIM=''; C_GREEN=''; C_RED=''; C_YELLOW=''; C_CYAN=''; C_BLUE=''
+fi
+
+print_help() {
+  cat <<EOF
+${C_BOLD}cra-sbom-report${C_RESET} — CRA-aligned SBOM compliance reporter
+
+${C_BOLD}USAGE${C_RESET}
+  cra-sbom-report <sbom-file> [options]
+
+${C_BOLD}ARGUMENTS${C_RESET}
+  <sbom-file>          Path to the SBOM. CycloneDX (JSON/XML) or SPDX (JSON/tag-value).
+
+${C_BOLD}OPTIONS${C_RESET}
+  --enhanced           Run enhanced-mode checks (hash algorithm/strength).
+  --no-enrich          Skip grype + sbomqs (offline / fast mode).
+  --output <path>      PDF output path. Default: ./cra-sbom-report-<ts>-<id>.pdf
+  --json <path>        Also write the raw report JSON to this path.
+  -h, --help           Show this help and exit.
+
+${C_BOLD}EXAMPLES${C_RESET}
+  cra-sbom-report sbom.cyclonedx.json
+  cra-sbom-report sbom.json --enhanced --output report.pdf
+  cra-sbom-report sbom.spdx --no-enrich --json report.json
+EOF
+}
+
+# ---------- parse args ----------
+SBOM=""
+ENHANCED=""
+NO_ENRICH=""
+OUTPUT=""
+JSON_OUT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) print_help; exit 0 ;;
+    --enhanced) ENHANCED="--enhanced"; shift ;;
+    --no-enrich) NO_ENRICH="--no-enrich"; shift ;;
+    --output) OUTPUT="${2:?--output requires a value}"; shift 2 ;;
+    --json) JSON_OUT="${2:?--json requires a value}"; shift 2 ;;
+    --) shift; SBOM="${1:?missing sbom path}"; shift; break ;;
+    -*) echo "error: unknown option: $1" >&2; print_help; exit 1 ;;
+    *)
+      if [[ -z "${SBOM}" ]]; then SBOM="$1"; shift
+      else echo "error: unexpected positional argument: $1" >&2; exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "${SBOM}" ]]; then
+  echo "error: SBOM file path is required" >&2
+  print_help
+  exit 1
+fi
+
+if [[ ! -f "${SBOM}" ]]; then
+  echo "error: SBOM file not found: ${SBOM}" >&2
+  exit 2
+fi
+
+# Default PDF path: cwd/cra-sbom-report-YYYY-MM-DD-HHMMSS-<short>.pdf
+if [[ -z "${OUTPUT}" ]]; then
+  TS="$(date +%Y-%m-%d-%H%M%S)"
+  SHORT="$(LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c 4 || echo 0000)"
+  OUTPUT="$(pwd)/cra-sbom-report-${TS}-${SHORT}.pdf"
+fi
+
+# ---------- dependency checks ----------
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "error: python3 not found in PATH" >&2
+  echo "       install it with: brew install python  (macOS) | apt install python3  (Debian/Ubuntu)" >&2
+  exit 4
+fi
+
+if ! python3 -c "import reportlab" >/dev/null 2>&1; then
+  cat >&2 <<EOF
+error: Python package 'reportlab' is required.
+       Install it with one of:
+         pip install --user reportlab
+         pip3 install --user reportlab
+       Or re-run the project installer:
+         ${REPO_ROOT}/install.sh
+EOF
+  exit 4
+fi
+
+# Optional tools — warn but don't abort.
+WARN_BUFFER=()
+if [[ -z "${NO_ENRICH}" ]]; then
+  command -v grype >/dev/null 2>&1   || WARN_BUFFER+=("grype not found — vulnerability enrichment will report 'unavailable'.")
+  command -v sbomqs >/dev/null 2>&1  || WARN_BUFFER+=("sbomqs not found — quality enrichment will report 'unavailable'.")
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  WARN_BUFFER+=("jq not found — falling back to a minimal Python summary parser.")
+fi
+
+# ---------- run the helper ----------
+HELPER_ARGS=( "${SBOM}" "--output" "${OUTPUT}" )
+[[ -n "${ENHANCED}" ]]  && HELPER_ARGS+=( "${ENHANCED}" )
+[[ -n "${NO_ENRICH}" ]] && HELPER_ARGS+=( "${NO_ENRICH}" )
+[[ -n "${JSON_OUT}" ]]  && HELPER_ARGS+=( "--json" "${JSON_OUT}" )
+
+REPORT_JSON="$(PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" \
+                python3 -m cra_sbom_cli.cli "${HELPER_ARGS[@]}")"
+
+if [[ -z "${REPORT_JSON}" ]]; then
+  echo "error: helper returned no output" >&2
+  exit 5
+fi
+
+# ---------- summary renderer ----------
+# Pull a single field from the JSON. Prefers jq; falls back to python3.
+_jget() {
+  local expr="$1"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "${REPORT_JSON}" | jq -r "${expr}"
+  else
+    printf '%s' "${REPORT_JSON}" | python3 -c '
+import json, sys, os
+data = json.loads(sys.stdin.read())
+expr = os.environ["EXPR"]
+parts = expr.lstrip(".").split(".")
+cur = data
+for p in parts:
+    if p == "":
+        continue
+    if isinstance(cur, list):
+        try: cur = cur[int(p)]
+        except (ValueError, IndexError): cur = ""; break
+    elif isinstance(cur, dict):
+        cur = cur.get(p, "")
+    else:
+        cur = ""; break
+print("" if cur is None else cur if isinstance(cur, str) else json.dumps(cur))
+' EXPR="${expr#.}" 2>/dev/null
+  fi
+}
+
+_h1() { printf "\n${C_BOLD}%s${C_RESET}\n" "$1"; }
+
+VERDICT="$(_jget '.verdict')"
+HARD_FAIL="$(_jget '.hard_fail_reason')"
+FORMAT="$(_jget '.format')"
+COMPONENT_COUNT="$(_jget '.component_count')"
+PASSED="$(_jget '.counts.passed')"
+FAILED="$(_jget '.counts.failed')"
+WARNINGS="$(_jget '.counts.warnings')"
+MANUAL="$(_jget '.counts.manual_items')"
+
+# Header banner — 60 cells wide between the corners
+HEADER_TITLE="CRA-Aligned SBOM Assessment"
+SOURCE_NAME="$(basename "${SBOM}")"
+BAR="────────────────────────────────────────────────────────────"
+
+printf "\n${C_BOLD}${C_BLUE}╭%s╮${C_RESET}\n" "${BAR}"
+printf "${C_BOLD}${C_BLUE}│${C_RESET} ${C_BOLD}%-58s${C_RESET} ${C_BOLD}${C_BLUE}│${C_RESET}\n" "${HEADER_TITLE}"
+printf "${C_BOLD}${C_BLUE}│${C_RESET} ${C_DIM}Source: %-50s${C_RESET} ${C_BOLD}${C_BLUE}│${C_RESET}\n" "${SOURCE_NAME:0:50}"
+printf "${C_BOLD}${C_BLUE}╰%s╯${C_RESET}\n" "${BAR}"
+
+if [[ "${VERDICT}" == "PASS" ]]; then
+  V_DISPLAY="${C_GREEN}${C_BOLD}✓ PASS${C_RESET}"
+else
+  V_DISPLAY="${C_RED}${C_BOLD}✗ FAIL${C_RESET}"
+fi
+
+MODE_DISPLAY="standard"
+[[ -n "${ENHANCED}" ]] && MODE_DISPLAY="enhanced"
+
+printf "\n  ${C_DIM}Verdict:${C_RESET}    %b\n" "${V_DISPLAY}"
+printf "  ${C_DIM}Format:${C_RESET}     %s\n" "${FORMAT}"
+printf "  ${C_DIM}Components:${C_RESET} %s\n" "${COMPONENT_COUNT}"
+printf "  ${C_DIM}Mode:${C_RESET}       %s\n" "${MODE_DISPLAY}"
+
+printf "\n  ${C_DIM}Counts:${C_RESET}\n"
+printf "    ${C_GREEN}Passed${C_RESET} %-4s   ${C_RED}Failed${C_RESET} %-4s   ${C_YELLOW}Warnings${C_RESET} %-4s   ${C_CYAN}Manual${C_RESET} %-4s\n" \
+  "${PASSED}" "${FAILED}" "${WARNINGS}" "${MANUAL}"
+
+if [[ -n "${HARD_FAIL}" && "${HARD_FAIL}" != "null" ]]; then
+  _h1 "Why the verdict is FAIL"
+  printf "  ${C_RED}hard-fail reason:${C_RESET} %s\n" "${HARD_FAIL}"
+fi
+
+GRYPE_STATUS="$(_jget '.enrichment.grype.status')"
+GRYPE_VULNS="$(_jget '.enrichment.grype.vulnerabilities')"
+SBOMQS_STATUS="$(_jget '.enrichment.sbomqs.status')"
+
+_h1 "Enrichment"
+case "${GRYPE_STATUS}" in
+  ok)          printf "  grype:  ${C_BOLD}%s${C_RESET} matches\n" "${GRYPE_VULNS}" ;;
+  skipped)     printf "  grype:  ${C_DIM}skipped${C_RESET}\n" ;;
+  *)           printf "  grype:  ${C_YELLOW}unavailable${C_RESET}\n" ;;
+esac
+case "${SBOMQS_STATUS}" in
+  ok)          printf "  sbomqs: ${C_DIM}see PDF for full output${C_RESET}\n" ;;
+  skipped)     printf "  sbomqs: ${C_DIM}skipped${C_RESET}\n" ;;
+  *)           printf "  sbomqs: ${C_YELLOW}unavailable${C_RESET}\n" ;;
+esac
+
+USE_COLOR=0
+[[ -t 1 ]] && USE_COLOR=1
+
+if [[ "${FAILED}" -gt 0 ]]; then
+  _h1 "Failed checks (top 5)"
+  printf '%s' "${REPORT_JSON}" | USE_COLOR="${USE_COLOR}" python3 -c '
+import json, os, sys
+use_color = os.environ.get("USE_COLOR") == "1"
+red = "\033[31m" if use_color else ""
+rst = "\033[0m"  if use_color else ""
+data = json.loads(sys.stdin.read())
+fails = [c for c in data.get("checks", []) if c.get("status") == "FAIL"]
+for c in fails[:5]:
+    req = c.get("requirement", "")
+    title = c.get("title", "")
+    detail = (c.get("detail") or "").splitlines()[0][:90]
+    print("  {}{}{}  {:<14} {:<40} {}".format(red, "X" if not use_color else "✗", rst, req, title, detail))
+'
+fi
+
+if [[ "${WARNINGS}" -gt 0 ]]; then
+  _h1 "Warnings (top 5)"
+  printf '%s' "${REPORT_JSON}" | USE_COLOR="${USE_COLOR}" python3 -c '
+import json, os, sys
+use_color = os.environ.get("USE_COLOR") == "1"
+yel = "\033[33m" if use_color else ""
+rst = "\033[0m"  if use_color else ""
+data = json.loads(sys.stdin.read())
+warns = [c for c in data.get("checks", []) if c.get("status") == "WARN"]
+for c in warns[:5]:
+    req = c.get("requirement", "")
+    title = c.get("title", "")
+    detail = (c.get("detail") or "").splitlines()[0][:90]
+    print("  {}{}{}  {:<14} {:<40} {}".format(yel, "!" if not use_color else "⚠", rst, req, title, detail))
+'
+fi
+
+# Manual evidence is intentionally not printed to the terminal — the PDF
+# carries the full catalogue. Only the count is in the summary block.
+
+_h1 "Normative basis"
+printf '%s' "${REPORT_JSON}" | python3 -c '
+import json, sys
+for n in (json.loads(sys.stdin.read()).get("normative_basis") or []):
+    print("  - {}".format(n))
+'
+
+if [[ ${#WARN_BUFFER[@]} -gt 0 ]]; then
+  _h1 "Notes"
+  for line in "${WARN_BUFFER[@]}"; do
+    printf "  ${C_YELLOW}!${C_RESET} %s\n" "${line}"
+  done
+fi
+
+printf "\n${C_BOLD}Detailed PDF:${C_RESET} %s\n" "${OUTPUT}"
+if [[ -n "${JSON_OUT}" ]]; then
+  printf "${C_BOLD}Report JSON:${C_RESET}  %s\n" "${JSON_OUT}"
+fi
+printf "\n${C_DIM}Summary covers SBOM-content checks only. Full conformity requires the manual evidence in the PDF.${C_RESET}\n\n"
+
+exit 0

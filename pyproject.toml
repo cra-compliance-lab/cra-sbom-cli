@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cra-sbom-cli"
+version = "0.1.0"
+description = "Run CRA-aligned compliance checks on a local SBOM and produce a PDF report."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "cra-sbom-cli contributors" }]
+keywords = ["sbom", "cra", "cyclonedx", "spdx", "compliance", "supply-chain"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+dependencies = [
+    "reportlab>=4.0,<5",
+]
+
+[project.scripts]
+cra-sbom-report = "cra_sbom_cli.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/your-org/cra-sbom-cli"
+Issues = "https://github.com/your-org/cra-sbom-cli/issues"
+
+[tool.setuptools.packages.find]
+include = ["cra_sbom_cli*"]
